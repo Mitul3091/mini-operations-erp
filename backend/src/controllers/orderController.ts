@@ -1,17 +1,38 @@
-import { Response } from "express";
+import { Request, Response } from "express";
+import { Prisma } from "../generated/prisma/client.js";
 import prisma from "../config/prisma.js";
-import { AuthRequest } from "../middleware/authMiddleware.js";
 import {
   createOrderSchema,
   updateOrderStatusSchema,
 } from "../validators/orderValidator.js";
 
-export const createOrder = async (req: AuthRequest, res: Response) => {
+export const createOrder = async (req: Request, res: Response) => {
   try {
-    const data = createOrderSchema.parse(req.body);
+    const result = createOrderSchema.safeParse(req.body);
+
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: result.error.flatten(),
+      });
+    }
+
+    const { orderNumber, customerId, locationId, items } = result.data;
+
+    const existingOrder = await prisma.customerOrder.findUnique({
+      where: { orderNumber },
+    });
+
+    if (existingOrder) {
+      return res.status(409).json({
+        success: false,
+        message: "Order number already exists",
+      });
+    }
 
     const customer = await prisma.customer.findUnique({
-      where: { id: data.customerId },
+      where: { id: customerId },
     });
 
     if (!customer) {
@@ -22,7 +43,7 @@ export const createOrder = async (req: AuthRequest, res: Response) => {
     }
 
     const location = await prisma.location.findUnique({
-      where: { id: data.locationId },
+      where: { id: locationId },
     });
 
     if (!location) {
@@ -32,204 +53,263 @@ export const createOrder = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    const itemIds = data.items.map((item) => item.itemId);
+    const itemIds = items.map((item) => item.itemId);
+    const uniqueItemIds = [...new Set(itemIds)];
 
-    if (new Set(itemIds).size !== itemIds.length) {
+    if (uniqueItemIds.length !== itemIds.length) {
       return res.status(400).json({
         success: false,
-        message: "Duplicate items are not allowed in one order",
+        message: "Duplicate items are not allowed in the same order",
       });
     }
 
-    const items = await prisma.item.findMany({
+    const existingItems = await prisma.item.findMany({
       where: {
         id: {
-          in: itemIds,
+          in: uniqueItemIds,
         },
+      },
+      select: {
+        id: true,
       },
     });
 
-    if (items.length !== itemIds.length) {
+    if (existingItems.length !== uniqueItemIds.length) {
       return res.status(404).json({
         success: false,
-        message: "One or more items not found",
+        message: "One or more items were not found",
       });
     }
 
-    const existingOrder = await prisma.customerOrder.findUnique({
-      where: { orderNumber: data.orderNumber },
-    });
+    const resultOrder = await prisma.$transaction(
+      async (tx) => {
+        const inventories = await tx.inventory.findMany({
+          where: {
+            locationId,
+            itemId: {
+              in: uniqueItemIds,
+            },
+          },
+          orderBy: {
+            id: "asc",
+          },
+        });
 
-    if (existingOrder) {
+        const allocationMap = new Map<number, Array<{
+          inventoryId: number;
+          quantity: number;
+        }>>();
+
+        for (const requestedItem of items) {
+          const itemInventories = inventories.filter(
+            (inventory) => inventory.itemId === requestedItem.itemId
+          );
+
+          const totalAvailable = itemInventories.reduce(
+            (total, inventory) =>
+              total +
+              (inventory.physicalQuantity - inventory.reservedQuantity),
+            0
+          );
+
+          if (totalAvailable < requestedItem.quantity) {
+            throw new Error(
+              JSON.stringify({
+                type: "INSUFFICIENT_STOCK",
+                itemId: requestedItem.itemId,
+                availableQuantity: totalAvailable,
+                requestedQuantity: requestedItem.quantity,
+              })
+            );
+          }
+
+          let remaining = requestedItem.quantity;
+          const allocations: Array<{
+            inventoryId: number;
+            quantity: number;
+          }> = [];
+
+          for (const inventory of itemInventories) {
+            if (remaining <= 0) {
+              break;
+            }
+
+            const available =
+              inventory.physicalQuantity -
+              inventory.reservedQuantity;
+
+            if (available <= 0) {
+              continue;
+            }
+
+            const quantityToReserve = Math.min(
+              available,
+              remaining
+            );
+
+            allocations.push({
+              inventoryId: inventory.id,
+              quantity: quantityToReserve,
+            });
+
+            remaining -= quantityToReserve;
+          }
+
+          allocationMap.set(
+            requestedItem.itemId,
+            allocations
+          );
+        }
+
+        for (const requestedItem of items) {
+          const allocations =
+            allocationMap.get(requestedItem.itemId) || [];
+
+          for (const allocation of allocations) {
+            const updatedInventory = await tx.inventory.updateMany({
+              where: {
+                id: allocation.inventoryId,
+                physicalQuantity: {
+                  gte: allocation.quantity,
+                },
+                reservedQuantity: {
+                  lte:
+                    inventories.find(
+                      (inventory) =>
+                        inventory.id === allocation.inventoryId
+                    )!.physicalQuantity -
+                    allocation.quantity,
+                },
+              },
+              data: {
+                reservedQuantity: {
+                  increment: allocation.quantity,
+                },
+              },
+            });
+
+            if (updatedInventory.count !== 1) {
+              throw new Error(
+                JSON.stringify({
+                  type: "CONCURRENT_RESERVATION_CONFLICT",
+                })
+              );
+            }
+
+            await tx.inventoryTransaction.create({
+              data: {
+                transactionKey: `RESERVATION-${orderNumber}-${allocation.inventoryId}`,
+                inventoryId: allocation.inventoryId,
+                itemId: requestedItem.itemId,
+                locationId,
+                batchId:
+                  inventories.find(
+                    (inventory) =>
+                      inventory.id === allocation.inventoryId
+                  )?.batchId ?? null,
+                type: "RESERVATION",
+                quantity: allocation.quantity,
+                createdById: req.user!.userId,
+              },
+            });
+          }
+        }
+
+        const order = await tx.customerOrder.create({
+          data: {
+            orderNumber,
+            customerId,
+            locationId,
+            createdById: req.user!.userId,
+            status: "RESERVED",
+            items: {
+              create: items.map((item) => ({
+                itemId: item.itemId,
+                quantity: item.quantity,
+              })),
+            },
+          },
+          include: {
+            customer: true,
+            location: true,
+            items: {
+              include: {
+                item: true,
+              },
+            },
+            createdBy: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+              },
+            },
+          },
+        });
+
+        return order;
+      },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      }
+    );
+
+    return res.status(201).json({
+      success: true,
+      message:
+        "Customer order created and stock reserved successfully",
+      order: resultOrder,
+    });
+  } catch (error: any) {
+    let parsedError: any = null;
+
+    try {
+      parsedError = JSON.parse(error?.message || "{}");
+    } catch {
+      parsedError = null;
+    }
+
+    if (parsedError?.type === "INSUFFICIENT_STOCK") {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient available stock for reservation",
+        details: {
+          itemId: parsedError.itemId,
+          availableQuantity: parsedError.availableQuantity,
+          requestedQuantity: parsedError.requestedQuantity,
+        },
+      });
+    }
+
+    if (
+      parsedError?.type === "CONCURRENT_RESERVATION_CONFLICT" ||
+      error?.code === "P2034"
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Stock reservation conflict. Please retry the order",
+      });
+    }
+
+    if (error?.code === "P2002") {
       return res.status(409).json({
         success: false,
         message: "Order number already exists",
       });
     }
 
-    const order = await prisma.$transaction(async (tx) => {
-      const inventories = await tx.inventory.findMany({
-        where: {
-          locationId: data.locationId,
-          itemId: {
-            in: itemIds,
-          },
-        },
-      });
+    console.error("Create order error:", error);
 
-      for (const requestedItem of data.items) {
-        const itemInventories = inventories.filter(
-          (inventory) => inventory.itemId === requestedItem.itemId
-        );
-
-        const availableQuantity = itemInventories.reduce(
-          (total, inventory) =>
-            total + inventory.physicalQuantity - inventory.reservedQuantity,
-          0
-        );
-
-        if (requestedItem.quantity > availableQuantity) {
-          const error = new Error("INSUFFICIENT_STOCK");
-          error.cause = {
-            itemId: requestedItem.itemId,
-            availableQuantity,
-            requestedQuantity: requestedItem.quantity,
-          };
-          throw error;
-        }
-      }
-
-      for (const requestedItem of data.items) {
-        let remainingQuantity = requestedItem.quantity;
-
-        const itemInventories = inventories.filter(
-          (inventory) => inventory.itemId === requestedItem.itemId
-        );
-
-        for (const inventory of itemInventories) {
-          if (remainingQuantity <= 0) {
-            break;
-          }
-
-          const availableQuantity =
-            inventory.physicalQuantity - inventory.reservedQuantity;
-
-          if (availableQuantity <= 0) {
-            continue;
-          }
-
-          const quantityToReserve = Math.min(
-            availableQuantity,
-            remainingQuantity
-          );
-
-          const updatedInventory = await tx.inventory.updateMany({
-            where: {
-              id: inventory.id,
-              physicalQuantity: {
-                gte: inventory.reservedQuantity + quantityToReserve,
-              },
-            },
-            data: {
-              reservedQuantity: {
-                increment: quantityToReserve,
-              },
-            },
-          });
-
-          if (updatedInventory.count !== 1) {
-            throw new Error("CONCURRENT_RESERVATION_CONFLICT");
-          }
-
-          await tx.inventoryTransaction.create({
-            data: {
-              transactionKey: `RESERVATION-${data.orderNumber}-${inventory.id}`,
-              inventoryId: inventory.id,
-              itemId: requestedItem.itemId,
-              locationId: data.locationId,
-              batchId: inventory.batchId,
-              type: "RESERVATION",
-              quantity: quantityToReserve,
-              createdById: req.user!.userId,
-            },
-          });
-
-          remainingQuantity -= quantityToReserve;
-        }
-
-        if (remainingQuantity > 0) {
-          throw new Error("CONCURRENT_RESERVATION_CONFLICT");
-        }
-      }
-
-      return tx.customerOrder.create({
-        data: {
-          orderNumber: data.orderNumber,
-          customerId: data.customerId,
-          locationId: data.locationId,
-          createdById: req.user!.userId,
-          status: "RESERVED",
-          items: {
-            create: data.items.map((item) => ({
-              itemId: item.itemId,
-              quantity: item.quantity,
-            })),
-          },
-        },
-        include: {
-          customer: true,
-          location: true,
-          items: {
-            include: {
-              item: true,
-            },
-          },
-          createdBy: {
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              role: true,
-            },
-          },
-        },
-      });
-    });
-
-    return res.status(201).json({
-      success: true,
-      message: "Customer order created and stock reserved successfully",
-      order,
-    });
-  } catch (error) {
-    console.error(error);
-
-    if (error instanceof Error && error.message === "INSUFFICIENT_STOCK") {
-      return res.status(400).json({
-        success: false,
-        message: "Insufficient available stock for reservation",
-        details: error.cause,
-      });
-    }
-
-    if (
-      error instanceof Error &&
-      error.message === "CONCURRENT_RESERVATION_CONFLICT"
-    ) {
-      return res.status(409).json({
-        success: false,
-        message: "Stock reservation conflict. Please retry the order",
-      });
-    }
-
-    return res.status(400).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to create customer order",
     });
   }
 };
 
-export const getOrders = async (_req: AuthRequest, res: Response) => {
+export const getOrders = async (_req: Request, res: Response) => {
   try {
     const orders = await prisma.customerOrder.findMany({
       orderBy: {
@@ -254,12 +334,12 @@ export const getOrders = async (_req: AuthRequest, res: Response) => {
       },
     });
 
-    return res.json({
+    return res.status(200).json({
       success: true,
       orders,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Get orders error:", error);
 
     return res.status(500).json({
       success: false,
@@ -269,7 +349,7 @@ export const getOrders = async (_req: AuthRequest, res: Response) => {
 };
 
 export const updateOrderStatus = async (
-  req: AuthRequest,
+  req: Request,
   res: Response
 ) => {
   try {
@@ -282,16 +362,28 @@ export const updateOrderStatus = async (
       });
     }
 
-    const data = updateOrderStatusSchema.parse(req.body);
+    const result = updateOrderStatusSchema.safeParse(req.body);
+
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: result.error.flatten(),
+      });
+    }
+
+    const { status } = result.data;
 
     const order = await prisma.customerOrder.findUnique({
-      where: { id: orderId },
+      where: {
+        id: orderId,
+      },
     });
 
     if (!order) {
       return res.status(404).json({
         success: false,
-        message: "Customer order not found",
+        message: "Order not found",
       });
     }
 
@@ -302,27 +394,33 @@ export const updateOrderStatus = async (
       });
     }
 
-    if (data.status === "CANCELLED") {
+    if (status === "CANCELLED") {
       return res.status(400).json({
         success: false,
-        message: "Order cancellation is not supported yet",
+        message: "Order cancellation is not supported",
       });
     }
 
-    if (
-      data.status === "COMPLETED" &&
-      order.status !== "RESERVED"
-    ) {
+    if (order.status === "COMPLETED") {
       return res.status(400).json({
         success: false,
-        message: "Only reserved orders can be completed",
+        message: "Completed orders cannot be updated",
+      });
+    }
+
+    if (order.status === "RESERVED" && status !== "COMPLETED") {
+      return res.status(400).json({
+        success: false,
+        message: "Reserved orders can only be completed",
       });
     }
 
     const updatedOrder = await prisma.customerOrder.update({
-      where: { id: orderId },
+      where: {
+        id: orderId,
+      },
       data: {
-        status: data.status,
+        status,
       },
       include: {
         customer: true,
@@ -332,18 +430,26 @@ export const updateOrderStatus = async (
             item: true,
           },
         },
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+          },
+        },
       },
     });
 
-    return res.json({
+    return res.status(200).json({
       success: true,
       message: "Order status updated successfully",
       order: updatedOrder,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Update order status error:", error);
 
-    return res.status(400).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to update order status",
     });
