@@ -1,0 +1,363 @@
+openapi: 3.0.3
+info:
+  title: Mini Operations ERP API
+  version: 1.0.0
+  description: API documentation for the Mini Operations ERP backend.
+servers:
+  - url: http://localhost:5000
+
+tags:
+  - name: Authentication
+  - name: Inventory
+  - name: Master Data
+  - name: Work Orders
+  - name: Transfers
+  - name: Customers
+  - name: Orders
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 6 }
+
+    RegisterRequest:
+      type: object
+      required: [name, email, password, role]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 6 }
+        role:
+          type: string
+          enum: [OPERATIONS_USER, SALES_USER]
+
+    InventoryCreate:
+      type: object
+      required: [itemId, locationId, physicalQuantity]
+      properties:
+        itemId: { type: integer }
+        locationId: { type: integer }
+        batchId: { type: integer, nullable: true }
+        physicalQuantity: { type: integer, minimum: 0 }
+        reservedQuantity: { type: integer, minimum: 0, default: 0 }
+
+    StockTransaction:
+      type: object
+      required: [inventoryId, type, quantity, transactionKey]
+      properties:
+        inventoryId: { type: integer }
+        type:
+          type: string
+          enum: [IN, OUT]
+        quantity: { type: integer, minimum: 1 }
+        transactionKey: { type: string }
+
+    WorkOrderCreate:
+      type: object
+      required: [workOrderNumber, locationId, itemId, requiredQuantity, assignedUserId]
+      properties:
+        workOrderNumber: { type: string }
+        locationId: { type: integer }
+        itemId: { type: integer }
+        requiredQuantity: { type: integer, minimum: 1 }
+        assignedUserId: { type: integer }
+
+    WorkOrderStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ASSIGNED, IN_PROGRESS, COMPLETED]
+
+    TransferCreate:
+      type: object
+      required: [transferNumber, sourceLocationId, destinationLocationId, itemId, quantity]
+      properties:
+        transferNumber: { type: string }
+        sourceLocationId: { type: integer }
+        destinationLocationId: { type: integer }
+        itemId: { type: integer }
+        quantity: { type: integer, minimum: 1 }
+
+    TransferStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [REQUESTED, DISPATCHED, RECEIVED]
+
+    CustomerCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+
+    OrderItem:
+      type: object
+      required: [itemId, quantity]
+      properties:
+        itemId: { type: integer }
+        quantity: { type: integer, minimum: 1 }
+
+    OrderCreate:
+      type: object
+      required: [orderNumber, customerId, locationId, items]
+      properties:
+        orderNumber: { type: string }
+        customerId: { type: integer }
+        locationId: { type: integer }
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItem'
+
+    OrderStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [RESERVED, COMPLETED, CANCELLED]
+
+paths:
+  /auth/register:
+    post:
+      tags: [Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201': { description: User registered }
+        '400': { description: Validation failed }
+        '409': { description: Email already exists }
+
+  /auth/login:
+    post:
+      tags: [Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { description: Login successful }
+        '400': { description: Validation failed }
+        '401': { description: Invalid credentials }
+
+  /inventory:
+    get:
+      tags: [Inventory]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Inventory list }
+    post:
+      tags: [Inventory]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InventoryCreate' }
+      responses:
+        '201': { description: Inventory created }
+        '400': { description: Validation or business rule failure }
+        '403': { description: Forbidden }
+
+  /inventory/transactions:
+    post:
+      tags: [Inventory]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StockTransaction' }
+      responses:
+        '200': { description: Transaction successful }
+        '400': { description: Business rule failure }
+        '403': { description: Forbidden }
+        '409': { description: Duplicate transaction }
+
+  /master-data/categories:
+    get:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Category list } }
+    post:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '201': { description: Category created } }
+
+  /master-data/locations:
+    get:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Location list } }
+    post:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '201': { description: Location created } }
+
+  /master-data/items:
+    get:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Item list } }
+    post:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '201': { description: Item created } }
+
+  /master-data/batches:
+    get:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Batch list } }
+    post:
+      tags: [Master Data]
+      security: [{ bearerAuth: [] }]
+      responses: { '201': { description: Batch created } }
+
+  /work-orders:
+    get:
+      tags: [Work Orders]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Work order list } }
+    post:
+      tags: [Work Orders]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkOrderCreate' }
+      responses:
+        '201': { description: Work order created }
+        '403': { description: Forbidden }
+
+  /work-orders/{id}/status:
+    patch:
+      tags: [Work Orders]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkOrderStatus' }
+      responses:
+        '200': { description: Status updated }
+        '403': { description: Forbidden }
+
+  /transfers:
+    get:
+      tags: [Transfers]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Transfer list } }
+    post:
+      tags: [Transfers]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferCreate' }
+      responses:
+        '201': { description: Transfer created }
+        '400': { description: Business rule failure }
+        '403': { description: Forbidden }
+
+  /transfers/{id}/status:
+    patch:
+      tags: [Transfers]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferStatus' }
+      responses:
+        '200': { description: Status updated }
+        '400': { description: Invalid state transition or insufficient stock }
+        '403': { description: Forbidden }
+
+  /customers:
+    get:
+      tags: [Customers]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Customer list } }
+    post:
+      tags: [Customers]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CustomerCreate' }
+      responses: { '201': { description: Customer created } }
+
+  /orders:
+    get:
+      tags: [Orders]
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Order list } }
+    post:
+      tags: [Orders]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreate' }
+      responses:
+        '201': { description: Order created and stock reserved }
+        '400': { description: Insufficient stock or validation failure }
+        '403': { description: Forbidden }
+        '409': { description: Reservation conflict }
+
+  /orders/{id}/status:
+    patch:
+      tags: [Orders]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderStatus' }
+      responses:
+        '200': { description: Order status updated }
+        '400': { description: Invalid status transition }
+        '403': { description: Forbidden }
